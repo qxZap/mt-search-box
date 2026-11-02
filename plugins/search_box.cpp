@@ -14,6 +14,10 @@
 // Matching: every word typed must appear in the row key or the display name, in any order.
 // Decal rows have no name, so those match on the key alone (GeomShape_01_003-star).
 //
+// Engines: when the part list holds engines, a row of the game's W_CheckBox appears under
+// the box, one per fuel, all ticked; unticking one hides that fuel. The fuel is on the
+// engine asset, which the row only points at softly, so each is loaded on first use.
+//
 // shortcut: the key offsets below come from the code that fills the items, and the box
 // lands under the list because AddChild only appends. An update moving the keys only
 // matches less (an item with no key is always shown); check here after a game update.
@@ -44,7 +48,11 @@ struct Screen {
     std::vector<uintptr_t> shown;
     std::wstring query;
     bool gaveUp = false;
+    uintptr_t panel = 0, fuelBar = 0, fuelBox[3] = {};
+    bool fuelOn[3] = {true, true, true}, barShown = false;
 };
+
+static const struct { const wchar_t* label; int fuel; } FUELS[3] = {{L"Gasoline", 1}, {L"Diesel", 2}, {L"Electric", 3}};  // EMTFuelType
 
 static uintptr_t cListView, cVBox, cSearch, cText;
 static uintptr_t gameplayCDO, widgetCDO, textCDO;
@@ -55,6 +63,10 @@ static std::mutex lock;
 static std::vector<Ref> found;      // worker -> game thread
 static std::vector<Screen> screens;  // game thread only
 static std::map<std::string, std::wstring> names;  // row key -> lower-case display names
+static std::map<std::string, uintptr_t> engineRows;  // row key -> row, for rows with an engine asset
+static std::map<std::string, int> fuels;             // row key -> EMTFuelType, once loaded
+static uintptr_t cHBox, cCheck, cEngine, systemCDO, fLoad, fIsChecked, fSetChecked, fSetText, fToText;
+static int oEngineAsset, oFuel, oLoadIn, oLoadRet, oStrIn, oStrRet;
 
 static std::wstring lower(std::wstring s) { for (auto& c : s) c = (wchar_t)towlower(c); return s; }
 
@@ -101,15 +113,41 @@ static void loadNames() {
                 uintptr_t d = get<uintptr_t>(row + k.texts + oNames); int m = get<int>(row + k.texts + oNames + 8);
                 for (int q = 0; q < m && q < 4; q++) text += L" " + toStr(d + q * (uintptr_t)(oRet - oInText));
                 names[key] += L" " + lower(text);
+                if (k.st == sPart) {
+                    uintptr_t soft[5] = {};  // TSoftObjectPtr: weak pointer, then the path
+                    rd(row + oEngineAsset, soft, sizeof soft);
+                    if (soft[1]) engineRows[key] = row;
+                }
             }
         }
     }
     MT_LOG("names: %d rows", (int)names.size());
 }
 
+static int fuelOf(const std::string& key) {
+    auto row = engineRows.find(key);
+    if (row == engineRows.end()) return 0;
+    auto known = fuels.find(key);
+    if (known != fuels.end()) return known->second;
+    unsigned char parms[0x60] = {0};
+    rd(row->second + oEngineAsset, parms + oLoadIn, oLoadRet - oLoadIn);
+    api->process_event(systemCDO, fLoad, parms);
+    uintptr_t asset = 0;
+    memcpy(&asset, parms + oLoadRet, 8);
+    return fuels[key] = asset ? get<uint8_t>(asset + oFuel) : 0;
+}
+
+static std::string itemKey(const Screen& s, uintptr_t item) {
+    char b[300];
+    return api->fname(item + s.kind->itemKey, b, sizeof b) ? b : "";
+}
+
 static bool matches(const Screen& s, uintptr_t item) {
     char b[300];
     if (api->fname(item + s.kind->itemKey, b, sizeof b) == 0) return true;
+    if (s.fuelBar)
+        for (int i = 0; i < 3; i++)
+            if (!s.fuelOn[i] && fuelOf(b) == FUELS[i].fuel) return false;
     std::wstring key(b, b + strlen(b));
     auto it = names.find(b);
     std::wstring hay = lower(key) + (it != names.end() ? it->second : L"");
@@ -143,6 +181,37 @@ static uintptr_t addTo(uintptr_t panel, uintptr_t child) {
     return p.slot;
 }
 
+static void setVisible(uintptr_t widget, bool visible) {
+    uint8_t v = visible ? 0 : 1;  // ESlateVisibility: Visible, Collapsed
+    api->process_event(widget, fSetVis, &v);
+}
+
+static void addFuelBar(Screen& s) {
+    if (!cCheck) cCheck = api->find_object("WidgetBlueprintGeneratedClass", "W_CheckBox_C", "/Game/UI/Button/W_CheckBox");
+    int oInner = cCheck ? off(cCheck, "CheckBox") : -1, oLabel = cCheck ? off(cCheck, "NameTextBlock") : -1;
+    if (oInner < 0 || oLabel < 0) { MT_LOG("no fuel filter -- W_CheckBox %p, CheckBox %d, label %d", (void*)cCheck, oInner, oLabel); return; }
+    struct { uintptr_t cls, outer, ret; } spawn = {cHBox, s.owner.ptr, 0};
+    api->process_event(gameplayCDO, fSpawn, &spawn);
+    if (!spawn.ret) return;
+    addTo(s.panel, spawn.ret);
+    setVisible(spawn.ret, false);
+    for (int i = 0; i < 3; i++) {
+        struct { uintptr_t context, cls, player, ret; } create = {s.owner.ptr, cCheck, 0, 0};
+        api->process_event(widgetCDO, fCreate, &create);
+        if (!create.ret) return;
+        addTo(spawn.ret, create.ret);
+        s.fuelBox[i] = get<uintptr_t>(create.ret + oInner);
+        uint8_t state = 1;  // ECheckBoxState::Checked
+        api->process_event(s.fuelBox[i], fSetChecked, &state);
+        unsigned char parms[0x40] = {0};
+        struct { const wchar_t* data; int num, max; } str = {FUELS[i].label, (int)wcslen(FUELS[i].label) + 1, (int)wcslen(FUELS[i].label) + 1};
+        memcpy(parms + oStrIn, &str, sizeof str);
+        api->process_event(textCDO, fToText, parms);
+        api->process_event(get<uintptr_t>(create.ret + oLabel), fSetText, parms + oStrRet);
+    }
+    s.fuelBar = spawn.ret;
+}
+
 static void addBox(Screen& s) {
     if (!cSearch) cSearch = api->find_object("WidgetBlueprintGeneratedClass", "W_StringSearchBox_C", "/Game/UI/Component/W_StringSearchBox");
     uintptr_t from = s.kind->ownWidget ? s.owner.ptr : s.list;
@@ -165,7 +234,8 @@ static void addBox(Screen& s) {
     api->process_event(spawn.ret, fSetVis, &collapsed);
     addTo(panel, create.ret);
 
-    s.hold = spawn.ret; s.box = create.ret; s.field = get<uintptr_t>(s.box + oField);
+    s.hold = spawn.ret; s.box = create.ret; s.field = get<uintptr_t>(s.box + oField); s.panel = panel;
+    if (s.kind->ownWidget) addFuelBar(s);
     MT_LOG("%s: search box added, %d items", s.kind->label, (int)itemsOf(s.list).size());
 }
 
@@ -176,13 +246,26 @@ static void update(Screen& s) {
     bool changed = td != s.textData;
     if (changed) { s.textData = td; s.query = lower(toStr(s.field + oText)); }
 
+    if (s.barShown)
+        for (int i = 0; i < 3; i++) {
+            bool on = callBool(s.fuelBox[i], fIsChecked);
+            changed = changed || on != s.fuelOn[i];
+            s.fuelOn[i] = on;
+        }
+
     auto items = itemsOf(s.list);
     bool rebuilt = items != s.shown;
     if (rebuilt) setItems(s.hold, items);
     if (!rebuilt && !changed) return;
 
-    if (!s.query.empty() && names.empty()) loadNames();
+    if ((s.fuelBar || !s.query.empty()) && names.empty()) loadNames();
     auto all = itemsOf(s.hold);
+    if (rebuilt && s.fuelBar) {
+        bool engines = false;
+        for (uintptr_t it : all) engines = engines || engineRows.count(itemKey(s, it));
+        if (engines != s.barShown) setVisible(s.fuelBar, engines);
+        s.barShown = engines;
+    }
     std::vector<uintptr_t> keep;
     for (uintptr_t it : all) if (matches(s, it)) keep.push_back(it);
     if (keep != items) setItems(s.list, keep);
@@ -215,6 +298,20 @@ static DWORD WINAPI run(LPVOID) {
     if (!api->wait_engine(INFINITE)) { MT_LOG("FAILED: no engine"); return 0; }
     cListView = api->find_object("Class", "ListView", "/Script/UMG");
     cVBox = api->find_object("Class", "VerticalBox", "/Script/UMG");
+    cHBox = api->find_object("Class", "HorizontalBox", "/Script/UMG");
+    cEngine = api->find_object("Class", "MHEngineDataAsset", "/Script/MotorTown");
+    uintptr_t sEngine = api->find_object("ScriptStruct", "MTEngineProperty", "/Script/MotorTown");
+    uintptr_t sRow = api->find_object("ScriptStruct", "VehiclePartRow", "/Script/MotorTown");
+    systemCDO = api->find_object("KismetSystemLibrary", "Default__KismetSystemLibrary", "/Script/Engine");
+    fLoad = api->find_object("Function", "LoadAsset_Blocking", "KismetSystemLibrary");
+    fIsChecked = api->find_object("Function", "IsChecked", "CheckBox");
+    fSetChecked = api->find_object("Function", "SetCheckedState", "CheckBox");
+    fSetText = api->find_object("Function", "SetText", "TextBlock");
+    fToText = api->find_object("Function", "Conv_StringToText", "KismetTextLibrary");
+    oEngineAsset = off(sRow, "EngineAsset");
+    oFuel = off(cEngine, "EngineProperty") + off(sEngine, "FuelType");
+    oLoadIn = off(fLoad, "Asset"); oLoadRet = off(fLoad, "ReturnValue");
+    oStrIn = off(fToText, "InString"); oStrRet = off(fToText, "ReturnValue");
     cText = api->find_object("Class", "EditableTextBox", "/Script/UMG");
     uintptr_t cWidget = api->find_object("Class", "Widget", "/Script/UMG");
     uintptr_t cSlot = api->find_object("Class", "PanelSlot", "/Script/UMG");
@@ -234,8 +331,8 @@ static DWORD WINAPI run(LPVOID) {
     oField = off(cBoxNative, "SearchTextBox"); oText = off(cText, "Text");
     oInText = off(fToStr, "InText"); oRet = off(fToStr, "ReturnValue");
 
-    uintptr_t need[] = {cVBox, gameplayCDO, widgetCDO, textCDO, fSpawn, fCreate, fAddChild, fSetVis, fSetItems, fIsVisible, fToStr};
-    int offs[] = {oItems, oEntryClass, oSlot, oParent, oField, oText, oInText, oRet};
+    uintptr_t need[] = {cVBox, cHBox, cEngine, systemCDO, fLoad, fIsChecked, fSetChecked, fSetText, fToText, gameplayCDO, widgetCDO, textCDO, fSpawn, fCreate, fAddChild, fSetVis, fSetItems, fIsVisible, fToStr};
+    int offs[] = {oEngineAsset, oFuel, oLoadIn, oLoadRet, oStrIn, oStrRet, oItems, oEntryClass, oSlot, oParent, oField, oText, oInText, oRet};
     bool ok = true;
     for (auto& k : kinds) {
         k.c = api->find_object("Class", k.cls, "/Script/MotorTown");

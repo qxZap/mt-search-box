@@ -10,6 +10,8 @@ Adds a search bar in various places of the game's UI:
 
 Every word typed must appear in the name, in any order. Decals have no display name, so those match on their row name.
 
+Engine lists also get Gasoline, Diesel and Electric checkboxes: all ticked, untick one to hide that fuel.
+
 ## Install
 
 Needs [Plugin Loader](https://github.com/qxZap/mt-plugin-loader) (`version.dll`) in
