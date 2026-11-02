@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/hero.png" alt="Search Box" width="100%">
+</p>
+
 # Search Box
 
 Plugin that adds a search bar to the game UI: tuning, decals and NPC shops.
