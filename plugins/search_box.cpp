@@ -367,7 +367,7 @@ static DWORD WINAPI run(LPVOID) {
     if (!ok) { MT_LOG("FAILED: widget classes not found -- no search box"); return 0; }
 
     for (int beat = 0;; beat++) {
-        if (beat % 7 == 0) {  // about a second
+        if (beat % 14 == 0) {  // about two seconds
             std::vector<Ref> v;
             for (int i = 0, n = api->num_objects(); i < n; i++) {
                 uintptr_t o = api->object(i);
