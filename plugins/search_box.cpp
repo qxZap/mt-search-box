@@ -44,9 +44,20 @@ static Kind kinds[] = {
 
 struct Ref { int index; uintptr_t ptr; };
 static bool alive(const Ref& r) { return r.ptr && api->object(r.index) == r.ptr; }
+static Ref refOf(uintptr_t o) { return {o ? get<int>(o + L().obj_index) : 0, o}; }
+
+// Never crash the game. Every widget the plugin calls into is checked alive first (not only the
+// screen's owner: the game rebuilds lists under an open screen), table rows are re-checked against
+// the table they came from before they are read (tables are rebuilt on load), and the frame tick runs
+// under a guard: a fault is logged, everything is re-checked after a 500 ms pause, and after MAX_FAULTS
+// in a session the plugin stops instead of risking the game again.
+static const int MAX_FAULTS = 5;
+static volatile LONG faults, disabled;
+static DWORD pauseUntil;
 
 struct Screen {
     Ref owner; Kind* kind;
+    std::vector<Ref> deps;  // every widget this screen calls into, checked alive before each update
     uintptr_t list = 0, box = 0, field = 0, hold = 0, textData = 0;
     std::vector<uintptr_t> shown;
     std::wstring query;
@@ -69,7 +80,8 @@ static std::mutex lock;
 static std::vector<Ref> found;      // worker -> game thread
 static std::vector<Screen> screens;  // game thread only
 static std::map<std::string, std::wstring> names;  // row key -> lower-case display names
-static std::map<std::string, uintptr_t> engineRows;  // row key -> row, for rows with an engine asset
+struct EngineRow { uintptr_t row; int snap; };  // snap: the table it came from (TableSnap), checked before use
+static std::map<std::string, EngineRow> engineRows;  // row key -> row, for rows with an engine asset
 struct Engine { int fuel, kind; };
 static std::map<std::string, Engine> engines;         // row key -> what the asset says, once loaded
 static uintptr_t cHBox, cCheck, cEngine, systemCDO, fLoad, fIsChecked, fSetChecked, fSetText, fToText;
@@ -77,8 +89,25 @@ static int oEngineAsset, oFuel, oDesc, oLoadIn, oLoadRet, oStrIn, oStrRet;
 
 static std::wstring lower(std::wstring s) { for (auto& c : s) c = (wchar_t)towlower(c); return s; }
 
+// An FText (UE 5.5) is a ref-counted pointer to its text data, then flags. A live one points at an object
+// whose vtable lies in the game's code. A freed or garbage FText (the 0xffff... read that crashed
+// Conv_TextToString) fails this and is skipped instead of handed to the game. Only the first 8 bytes are a
+// pointer: an older two-pointer reading rejected every text, typed searches included.
+static bool textAlive(uintptr_t ftext) {
+    static uintptr_t lo, hi;
+    if (!lo) {
+        lo = (uintptr_t)GetModuleHandleW(nullptr);
+        auto nt = (const IMAGE_NT_HEADERS*)(lo + ((const IMAGE_DOS_HEADER*)lo)->e_lfanew);
+        hi = lo + nt->OptionalHeader.SizeOfImage;
+    }
+    uintptr_t obj = get<uintptr_t>(ftext);
+    if (obj < 0x10000) return false;
+    uintptr_t vt = get<uintptr_t>(obj);
+    return vt >= lo && vt < hi;
+}
+
 static std::wstring toStr(uintptr_t ftext) {
-    if (!get<uintptr_t>(ftext)) return L"";
+    if (!textAlive(ftext)) return L"";
     unsigned char parms[0x40] = {0};
     rd(ftext, parms + oInText, oRet - oInText);
     api->process_event(textCDO, fToStr, parms);
@@ -89,46 +118,114 @@ static std::wstring toStr(uintptr_t ftext) {
     return rd(s, out.data(), (size_t)(len - 1) * 2) ? out : L"";
 }
 
-// Display names of every loaded part and item row. Runs once, on the first search.
-static void loadNames() {
+// Display names of every loaded part and item row, in two halves so the game never stalls on them:
+// collectNames (plugin thread, memory reads only) lists the rows once the first garage list is up;
+// nameSlice (game thread, about 3 ms a frame) turns their FTexts into strings, which needs the game.
+// A row pointer is only good while its table still holds the same row storage: each job names the
+// table it came from (snap), and the game thread checks that before reading the row.
+struct TableSnap { Ref table; int rowsAt; uintptr_t el; int num; };
+struct NameJob { std::string key; uintptr_t row; int plain, texts, snap, slot; };  // slot: index in the table's row set
+static std::vector<NameJob> nameJobs, pendingJobs;  // pending*: worker -> game thread under lock
+static std::vector<TableSnap> snaps, pendingSnaps;
+static size_t nameAt;
+static bool taken;  // game thread has swapped the pending lists in
+static volatile LONG wantNames, namesListed;
+static volatile bool namesDone;
+static std::map<std::string, EngineRow> listedEngines;  // handed to engineRows on the game thread
+
+static bool snapSame(int i) {
+    if (i < 0 || i >= (int)snaps.size()) return false;
+    const TableSnap& s = snaps[i];
+    return alive(s.table) && get<uintptr_t>(s.table.ptr + s.rowsAt + 8) == s.el && get<int>(s.table.ptr + s.rowsAt + 16) == s.num;
+}
+
+// Game thread: a table changed under the names, so list them again from scratch.
+static void relistNames(const char* why) {
+    MT_LOG("names: %s -- listing again", why);
+    nameJobs.clear(); snaps.clear(); engineRows.clear(); names.clear();
+    nameAt = 0; taken = false; namesDone = false;
+    InterlockedExchange(&namesListed, 0);
+    InterlockedExchange(&wantNames, 1);
+}
+
+static void collectNames() {
     uintptr_t sPart = api->find_object("ScriptStruct", "VehiclePartRow", "/Script/MotorTown");
     uintptr_t sItem = api->find_object("ScriptStruct", "MTItemRow", "/Script/MotorTown");
-    uintptr_t sTexts = api->find_object("ScriptStruct", "MTTextByTexts", "/Script/MotorTown");
-    int oNames = off(sTexts, "Texts");
+    uintptr_t cTable = api->find_object("Class", "DataTable", "/Script/Engine");
     struct { uintptr_t st; int plain, texts; } rowKinds[] = {
         {sPart, off(sPart, "Name"), off(sPart, "Name2")},
         {sItem, off(sItem, "ItemName"), off(sItem, "ItemNameTexts")},
     };
+    std::vector<NameJob> jobs;
+    std::vector<TableSnap> tables;
+    std::map<std::string, EngineRow> engines;
     for (int i = 0, n = api->num_objects(); i < n; i++) {
         uintptr_t t = api->object(i);
-        if (!t || isCDO(t)) continue;
-        std::string cn = objName(classOf(t));
-        if (cn != "DataTable" && cn != "CompositeDataTable") continue;
+        if (!t || isCDO(t) || !api->is_a(classOf(t), cTable)) continue;  // CompositeDataTable is one too
         int rs = -1; uintptr_t st = 0;
         for (int x = 0x28; x <= 0x48 && rs < 0; x += 8) {
             uintptr_t q = get<uintptr_t>(t + x);
-            if (q && objName(classOf(q)) == "ScriptStruct") { rs = x; st = q; }
+            if (q && (q == sPart || q == sItem)) { rs = x; st = q; }
         }
         for (auto& k : rowKinds) {
             if (rs < 0 || st != k.st) continue;
             uintptr_t el = get<uintptr_t>(t + rs + 8); int num = get<int>(t + rs + 16);
+            if (!el || num <= 0 || num > 200000) continue;
+            int snap = (int)tables.size();
+            tables.push_back({{i, t}, rs, el, num});
             for (int j = 0; j < num; j++) {  // TSetElement: FName, uint8*, hash links = 24 bytes
                 uintptr_t row = get<uintptr_t>(el + 24ull * j + 8);
                 std::string key = fname(el + 24ull * j);
                 if (!row || key.empty()) continue;
-                std::wstring text = toStr(row + k.plain);
-                uintptr_t d = get<uintptr_t>(row + k.texts + oNames); int m = get<int>(row + k.texts + oNames + 8);
-                for (int q = 0; q < m && q < 4; q++) text += L" " + toStr(d + q * (uintptr_t)(oRet - oInText));
-                names[key] += L" " + lower(text);
+                jobs.push_back({key, row, k.plain, k.texts, snap, j});
                 if (k.st == sPart) {
                     uintptr_t soft[5] = {};  // TSoftObjectPtr: weak pointer, then the path
                     rd(row + oEngineAsset, soft, sizeof soft);
-                    if (soft[1]) engineRows[key] = row;
+                    if (soft[1]) engines[key] = {row, snap};
                 }
             }
         }
     }
+    std::lock_guard<std::mutex> g(lock);
+    pendingJobs.swap(jobs);
+    pendingSnaps.swap(tables);
+    listedEngines.swap(engines);
+    InterlockedExchange(&namesListed, 1);
+    MT_LOG("names: %d rows listed from %d tables", (int)pendingJobs.size(), (int)pendingSnaps.size());
+}
+
+// Game thread. True once every name is in.
+static bool nameSlice() {
+    if (!namesListed) { InterlockedExchange(&wantNames, 1); return false; }
+    if (namesDone) return true;
+    if (!taken) {
+        std::lock_guard<std::mutex> g(lock);
+        nameJobs.swap(pendingJobs); snaps.swap(pendingSnaps); engineRows.swap(listedEngines);
+        pendingJobs.clear(); pendingSnaps.clear(); listedEngines.clear();
+        taken = true;
+    }
+    static int oNames = off(api->find_object("ScriptStruct", "MTTextByTexts", "/Script/MotorTown"), "Texts");
+    LARGE_INTEGER hz, from, now;
+    QueryPerformanceFrequency(&hz); QueryPerformanceCounter(&from);
+    std::vector<signed char> ok(snaps.size(), -1);  // each table checked once a slice
+    for (; nameAt < nameJobs.size(); nameAt++) {
+        QueryPerformanceCounter(&now);
+        if ((now.QuadPart - from.QuadPart) * 1000 > 3 * hz.QuadPart) break;  // 3 ms a frame
+        const NameJob& k = nameJobs[nameAt];
+        if (k.snap < 0 || k.snap >= (int)ok.size()) continue;
+        if (ok[k.snap] < 0) ok[k.snap] = snapSame(k.snap);
+        if (!ok[k.snap] || get<uintptr_t>(snaps[k.snap].el + 24ull * k.slot + 8) != k.row) {
+            relistNames("a table changed while names were read"); return false;
+        }
+        std::wstring text = toStr(k.row + k.plain);
+        uintptr_t d = get<uintptr_t>(k.row + k.texts + oNames); int m = get<int>(k.row + k.texts + oNames + 8);
+        for (int q = 0; q < m && q < 4; q++) text += L" " + toStr(d + q * (uintptr_t)(oRet - oInText));
+        names[k.key] += L" " + lower(text);
+    }
+    if (nameAt < nameJobs.size()) return false;
+    namesDone = true;
     MT_LOG("names: %d rows", (int)names.size());
+    return true;
 }
 
 static Engine engineOf(const std::string& key) {
@@ -136,12 +233,14 @@ static Engine engineOf(const std::string& key) {
     if (row == engineRows.end()) return {0, 0};
     auto known = engines.find(key);
     if (known != engines.end()) return known->second;
+    if (!snapSame(row->second.snap)) { relistNames("an engine's table changed"); return {0, 0}; }  // never read a freed row
+    uintptr_t r = row->second.row;
     unsigned char parms[0x60] = {0};
-    rd(row->second + oEngineAsset, parms + oLoadIn, oLoadRet - oLoadIn);
+    rd(r + oEngineAsset, parms + oLoadIn, oLoadRet - oLoadIn);
     api->process_event(systemCDO, fLoad, parms);
     uintptr_t asset = 0;
     memcpy(&asset, parms + oLoadRet, 8);
-    std::wstring desc = lower(toStr(row->second + oDesc));
+    std::wstring desc = lower(toStr(r + oDesc));
     size_t tags = desc.find(L"tags:");
     int kind = 0;
     if (tags != std::wstring::npos) {
@@ -228,6 +327,8 @@ static void addFuelBar(Screen& s) {
         api->process_event(textCDO, fToText, parms);
         api->process_event(get<uintptr_t>(create.ret + oLabel), fSetText, parms + oStrRet);
     }
+    for (uintptr_t w : s.bars) s.deps.push_back(refOf(w));
+    for (uintptr_t w : s.boxes) s.deps.push_back(refOf(w));
     s.ready = true;
 }
 
@@ -254,11 +355,34 @@ static void addBox(Screen& s) {
     addTo(panel, create.ret);
 
     s.hold = spawn.ret; s.box = create.ret; s.field = get<uintptr_t>(s.box + oField); s.panel = panel;
+    for (uintptr_t w : {panel, s.hold, s.box, s.field}) s.deps.push_back(refOf(w));
     if (s.kind->ownWidget) addFuelBar(s);
     MT_LOG("%s: search box added, %d items", s.kind->label, (int)itemsOf(s.list).size());
 }
 
+// The game swapped the list, or something this screen calls into is gone: hide what is still there
+// (so a fresh box does not sit under a dead one) and start the screen over on the current list.
+// Alive by the index recorded when the widget was made: a freed address reused by another object fails.
+static bool stillAlive(const Screen& s, uintptr_t p) {
+    for (auto& d : s.deps) if (p && d.ptr == p) return alive(d);
+    return false;
+}
+
+static void restart(Screen& s, uintptr_t list) {
+    if (stillAlive(s, s.box)) setVisible(s.box, false);
+    for (uintptr_t bar : s.bars) if (stillAlive(s, bar)) setVisible(bar, false);
+    MT_LOG("%s: list rebuilt under the screen -- search box set up again", s.kind->label);
+    Screen fresh{s.owner, s.kind};
+    fresh.list = list;
+    if (list) fresh.deps.push_back(refOf(list));
+    s = fresh;
+}
+
 static void update(Screen& s) {
+    uintptr_t list = get<uintptr_t>(s.owner.ptr + s.kind->oList);
+    bool dead = list != s.list;
+    for (auto& d : s.deps) dead = dead || !alive(d);
+    if (dead) { restart(s, list); if (!s.list) return; }
     if (!s.box) { if (callBool(s.list, fIsVisible)) addBox(s); if (!s.box) return; }
 
     uintptr_t td = get<uintptr_t>(s.field + oText);
@@ -277,7 +401,7 @@ static void update(Screen& s) {
     if (rebuilt) setItems(s.hold, items);
     if (!rebuilt && !changed) return;
 
-    if ((s.ready || !s.query.empty()) && names.empty()) loadNames();
+    if (s.ready || !s.query.empty()) nameSlice();
     auto all = itemsOf(s.hold);
     if (rebuilt && s.ready) {
         bool has = false;
@@ -292,9 +416,12 @@ static void update(Screen& s) {
 }
 
 static void tick(void*) {
+    // Names come in a slice a frame; when the last one is in, every open list filters again.
+    if (wantNames && !namesDone && nameSlice()) for (auto& s : screens) s.shown.clear();
     std::vector<Ref> add;
     { std::lock_guard<std::mutex> g(lock); add.swap(found); }
     for (auto& r : add) {
+        if (!alive(r)) continue;  // listed by the worker up to two seconds ago
         bool known = false;
         for (auto& s : screens) known = known || s.owner.ptr == r.ptr;
         if (known) continue;
@@ -302,13 +429,38 @@ static void tick(void*) {
             if (!api->is_a(classOf(r.ptr), k.c)) continue;
             Screen s{r, &k};
             s.list = get<uintptr_t>(r.ptr + k.oList);
-            if (s.list) screens.push_back(s);
+            if (s.list) { s.deps.push_back(refOf(s.list)); screens.push_back(s); }
         }
     }
     for (size_t i = 0; i < screens.size();) {
         if (!alive(screens[i].owner)) { screens.erase(screens.begin() + i); continue; }
         if (!screens[i].gaveUp) update(screens[i]);
         i++;
+    }
+}
+
+// After a fault: every screen re-checks its widgets from scratch and the names are listed again.
+static void afterFault() {
+    for (auto& s : screens) s.deps.push_back({0, 1});  // never alive (object 0 is not at 1): update() restarts the screen
+    relistNames("recovering after a fault");
+}
+
+static int faultFilter(unsigned code) {
+    return code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR || code == EXCEPTION_DATATYPE_MISALIGNMENT
+        ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
+}
+
+// No C++ objects in here, so it can hold the SEH guard (tick itself has them).
+static void guardedTick(void* p) {
+    if (disabled || (int)(GetTickCount() - pauseUntil) < 0) return;
+    __try {
+        tick(p);
+    } __except (faultFilter(GetExceptionCode())) {
+        LONG n = InterlockedIncrement(&faults);
+        pauseUntil = GetTickCount() + 500;
+        MT_LOG("FAULT %ld of %d caught in the search box tick -- retrying in 500 ms", n, MAX_FAULTS);
+        if (n >= MAX_FAULTS) { InterlockedExchange(&disabled, 1); MT_LOG("too many faults: Search Box stops for this session"); return; }
+        __try { afterFault(); } __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedExchange(&disabled, 1); }
     }
 }
 
@@ -379,8 +531,10 @@ static DWORD WINAPI run(LPVOID) {
             std::lock_guard<std::mutex> g(lock);
             found.swap(v);
         }
-        if (api->game_thread_ready()) api->run_on_game_thread(tick, nullptr);
-        Sleep(150);
+        if (disabled) return 0;
+        if (wantNames && !namesListed) collectNames();
+        if (api->game_thread_ready()) api->run_on_game_thread(guardedTick, nullptr);
+        Sleep(namesListed && !namesDone ? 16 : 150);  // a frame at a time while names are coming in
     }
 }
 
