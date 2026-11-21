@@ -445,17 +445,14 @@ static void afterFault() {
     relistNames("recovering after a fault");
 }
 
-static int faultFilter(unsigned code) {
-    return code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR || code == EXCEPTION_DATATYPE_MISALIGNMENT
-        ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
-}
+static int faultFilter(unsigned code, EXCEPTION_POINTERS* ep) { return ownFaultOnly(code, ep); }
 
 // No C++ objects in here, so it can hold the SEH guard (tick itself has them).
 static void guardedTick(void* p) {
     if (disabled || (int)(GetTickCount() - pauseUntil) < 0) return;
     __try {
         tick(p);
-    } __except (faultFilter(GetExceptionCode())) {
+    } __except (faultFilter(GetExceptionCode(), GetExceptionInformation())) {
         LONG n = InterlockedIncrement(&faults);
         pauseUntil = GetTickCount() + 500;
         MT_LOG("FAULT %ld of %d caught in the search box tick -- retrying in 500 ms", n, MAX_FAULTS);
@@ -519,6 +516,7 @@ static DWORD WINAPI run(LPVOID) {
     if (!ok) { MT_LOG("FAILED: widget classes not found -- no search box"); return 0; }
 
     for (int beat = 0;; beat++) {
+        if (api->stopping()) return 0;   // the game is closing: this thread ends with it
         if (beat % 14 == 0) {  // about two seconds
             std::vector<Ref> v;
             for (int i = 0, n = api->num_objects(); i < n; i++) {
